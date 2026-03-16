@@ -40,7 +40,7 @@ if has_cuda:
     ]
     ext_modules = [
         CUDAExtension(
-            "mast3r_slam_backends",
+            name="mast3r_slam_backends",
             include_dirs=include_dirs,
             sources=sources,
             extra_compile_args=extra_compile_args,
@@ -50,6 +50,7 @@ else:
     print("CUDA not found, cannot compile backend!")
 
 setup(
+    name="mast3r_slam_backends",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

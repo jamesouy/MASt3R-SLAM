@@ -6,14 +6,14 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 import os
 
 # ROOT = os.path.dirname(os.path.abspath(__file__))
-ROOT = Path(__file__).parent.parent.parent
+ROOT = Path(__file__).parent.parent.parent.absolute()
 has_cuda = torch.cuda.is_available()
 
 include_dirs = [
     # os.path.join(ROOT, "mast3r_slam/backend/include"),
     # os.path.join(ROOT, "thirdparty/eigen"),
-    (Path(__file__).parent.parent / "include").as_uri(),
-    (Path(__file__).parent.parent.parent.parent / "thirdparty" / "eigen").as_uri(),
+    str(Path(__file__).parent.parent / "include"),
+    str(Path(__file__).parent.parent.parent.parent / "thirdparty" / "eigen"),
 ]
 
 sources = [

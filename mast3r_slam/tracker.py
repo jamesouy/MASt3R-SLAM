@@ -40,8 +40,14 @@ class FrameTracker:
 
         Qk = torch.sqrt(Qff[idx_f2k] * Qkf)
 
-        # Update keyframe pointmap after registration (need pose)
-        frame.update_pointmap(Xff, Cff)
+        Cff_filtered = Cff.clone()
+        if frame.dynamic_mask_flat is not None:
+            Cff_filtered.view(-1)[frame.dynamic_mask_flat] = 0.0
+            # aligning shapes ^^  ^^^^^^^^^^^^^^^^^^^^^^^ applying mask
+
+        # Update keyframe pointmap after registration (need pose)        
+        frame.update_pointmap(Xff, Cff_filtered)
+        # frame.update_pointmap(Xff, Cff)
 
         use_calib = config["use_calib"]
         img_size = frame.img.shape[-2:]
@@ -96,7 +102,18 @@ class FrameTracker:
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
-        keyframe.update_pointmap(Xkk, Ckf)
+
+        Ckf_filtered = Ckf.clone()
+        if frame.dynamic_mask_flat is not None:
+            # Ckf is (N, 1). Masking moving objects in the current view.
+            # Using idx_f2k to map current frame mask to keyframe points
+            mask_in_kf = frame.dynamic_mask_flat[idx_f2k]
+            Ckf_filtered.view(-1)[mask_in_kf] = 0.0
+            # aligning shapes ^^  ^^^^^^^^^^^^^^^^^^^^^^^ applying mask
+
+        keyframe.update_pointmap(Xkk, Ckf_filtered)
+        # keyframe.update_pointmap(Xkk, Ckf)
+
         # write back the fitered pointmap
         self.keyframes[len(self.keyframes) - 1] = keyframe
 

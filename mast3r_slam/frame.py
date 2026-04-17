@@ -6,6 +6,13 @@ import torch
 from mast3r_slam.mast3r_utils import resize_img
 from mast3r_slam.config import config
 
+import os
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from ultralytics import YOLO
+
+YOLO_MODEL = YOLO("yolov8x-seg.pt")
+
 
 class Mode(Enum):
     INIT = 0
@@ -29,6 +36,10 @@ class Frame:
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
+
+    ########################################################################
+    dynamic_mask_flat: Optional[torch.Tensor] = None
+    ########################################################################
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
@@ -119,6 +130,79 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
         uimg = uimg[::downsample, ::downsample]
         img_shape = img_shape // downsample
     frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
+
+    ########################################################################
+    #### BEGIN INJECTED CODE ###############################################
+    ######################################################################## 
+    if YOLO_MODEL is not None:
+        # Convert uimg (0 to 1 tensor) back to a standard numpy image for YOLO
+        img_np = (uimg.cpu().numpy() * 255.0).astype("uint8")
+        
+        with torch.no_grad():
+            # Classes: 0=person, 2=car, 5=bus, 7=truck
+            res = YOLO_MODEL(img_np, classes=[0, 2, 5, 7], verbose=False)
+            
+        if res[0].masks is not None:
+            # Get masks data (N, H_yolo, W_yolo)
+            masks = res[0].masks.data
+            
+            # Interpolate back to the exact height and width of uimg
+            h, w = uimg.shape[:2]
+            masks_resized = F.interpolate(
+                masks.unsqueeze(1), size=(h, w), mode='nearest'
+            ).squeeze(1)
+            
+            # Combine all dynamic objects into one boolean mask
+            combined_mask_2d = torch.any(masks_resized, dim=0).bool()
+
+            # Set kernel_size (e.g., 5 or 7 pixels). Use an odd number.
+            dilation_size = 7 
+            padding = dilation_size // 2
+            
+            # max_pool2d acts as dilation on a binary mask
+            # We add batch and channel dims for the operator, then squeeze back
+            dilated_mask = F.max_pool2d(
+                combined_mask_2d.float().unsqueeze(0).unsqueeze(0), 
+                kernel_size=dilation_size, 
+                stride=1, 
+                padding=padding
+            ).bool().squeeze()
+            
+            # Store the dilated version
+            frame.dynamic_mask_flat = dilated_mask.view(-1).to(device)
+
+            mask_np = dilated_mask.cpu().numpy()
+            
+            # Create an overlay (highlight masked areas in red)
+            overlay_img = img_np.copy()
+            overlay_img[mask_np] = [255, 0, 0] # Red overlay
+            
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+            os.makedirs("/mnt/sdb/cs592/Downloads/debug_yolo_masks", exist_ok=True)
+            
+            # 1. Original Image
+            axes[0].imshow(img_np)
+            axes[0].set_title(f"Original Frame {i}")
+            axes[0].axis("off")
+            
+            # 2. Raw Binary Mask
+            axes[1].imshow(mask_np, cmap="gray")
+            axes[1].set_title("YOLO Dynamic Mask")
+            axes[1].axis("off")
+            
+            # 3. Overlay to verify alignment
+            axes[2].imshow(overlay_img)
+            axes[2].set_title("Alignment Verification")
+            axes[2].axis("off")
+            
+            plt.tight_layout()
+            plt.savefig(f"/mnt/sdb/cs592/Downloads/debug_yolo_masks/frame_{i:04d}.png", bbox_inches='tight')
+            plt.close(fig)
+    ########################################################################
+    #### END INJECTED CODE #################################################
+    ######################################################################## 
+
     return frame
 
 

@@ -10,7 +10,22 @@ from mast3r_slam.geometry import (
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
 from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
+import os
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as F_vision
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+from torchvision.utils import flow_to_image
+from ultralytics import FastSAM
+import torch.nn.functional as F
 
+
+def plot_img(ax, title: str, img: torch.Tensor):
+    ax.imshow(img.cpu().numpy())
+    ax.set_title(title)
+    ax.axis("off")
+def plot_flow(ax, title: str, flow: torch.Tensor): # flow is [2, H, W]
+    flow_img_tensor = flow_to_image(flow).squeeze(0)
+    plot_img(ax, title, flow_img_tensor.permute(1, 2, 0))
 
 class FrameTracker:
     def __init__(self, model, frames, device):
@@ -21,12 +36,194 @@ class FrameTracker:
 
         self.reset_idx_f2k()
 
+        # ====================================================================
+        os.makedirs("debug_optical_flow", exist_ok=True)
+        print("Loading RAFT Optical Flow Model...")
+        
+        # from opticalflow.sea_raft import SEA_RAFT as OPTICAL_FLOW_MODEL
+        # self.flow_model = OPTICAL_FLOW_MODEL(device=self.device)
+
+        weights = Raft_Large_Weights.DEFAULT
+        self.raft_model = raft_large(weights=weights, progress=False).to(self.device)
+        self.raft_model.eval()
+
+        print("Loading FastSAM-S Model...")
+        self.fastsam = FastSAM("FastSAM-s.pt")
+
+        self.flow_offsets = [1, 4, 8, 12] 
+        self.max_offset = max(self.flow_offsets)
+        self.frame_history = [] # 0=curr frame, 1=last frame, etc
+        # ====================================================================
+
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
         self.idx_f2k = None
 
+    def compute_mask(self, frame: Frame):
+        offset = 4
+        if len(self.frame_history) <= offset:
+            return
+
+        [[H, W]] = frame.img_true_shape
+        prev_frame = self.frame_history[offset]
+
+        num_plots = 4
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
+        
+        # transform points from prev frame to curr frame to get depth
+        # T_proj = frame.T_WC.inv() * prev_frame.T_WC
+        # T_proj = prev_frame.T_WC.inv() * frame.T_WC
+        T_proj = frame.T_WC * prev_frame.T_WC.inv()
+        print(f"trans prev->curr: {T_proj.translation()}")
+        X_prev = prev_frame.T_WC.act(prev_frame.X_canon) # world -> prev frame coords
+        # X_prev = X_prev * torch.tensor([1, -1, 1], device=self.device)
+        X_proj = frame.T_WC.inv().act(X_prev) # prev frame -> curr frame
+        # X_proj = T_proj.act(prev_frame.X_canon * torch.tensor([1, -1, 1], device=self.device)) # prev frame -> curr frame
+        # X_proj = X_proj * torch.tensor([1, -1, 1], device=self.device)
+        depth = X_proj[:, 2]
+        plot_img(axes[0], f"Depth {frame.frame_id}", depth.view(H, W))
+
+        u_proj = (X_proj[:, 0] / depth.clamp(min=0.0001))
+        v_proj = (X_proj[:, 1] / depth.clamp(min=0.0001))
+        u_proj = (u_proj - u_proj.min()) * W / (u_proj.max()-u_proj.min())
+        v_proj = (v_proj - v_proj.min()) * H / (v_proj.max()-v_proj.min())
+
+        v_orig, u_orig = torch.meshgrid(
+            torch.arange(H, device=self.device, dtype=torch.float32),
+            torch.arange(W, device=self.device, dtype=torch.float32),
+            indexing="ij",
+        )
+
+        flow_exp = torch.stack([
+            u_orig - u_proj.view(H, W),
+            v_orig - v_proj.view(H, W),
+        ], dim=0)  # (2, H, W)
+        plot_flow(axes[1], f"Expected Flow {frame.frame_id}", flow_exp)
+
+        flow = self.raft_model(prev_frame.img, frame.img)[-1][0] # [2, H, W]
+        plot_flow(axes[2], f"Computed Flow {frame.frame_id}", flow)
+
+        residual = (flow - flow_exp).norm(dim=0)
+        residual = (residual - residual.median()).abs()
+        print("residual range:", residual.min(), residual.max())
+        plot_img(axes[3], f"Residual {frame.frame_id}", residual)
+        
+        if not os.path.exists("debug_optical_flow_depth"):
+            os.makedirs("debug_optical_flow_depth")
+        plt.tight_layout()
+        plt.savefig(f"debug_optical_flow_depth/{frame.frame_id:04d}.png", bbox_inches='tight')
+        plt.close(fig)
+
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
+
+        self.frame_history.insert(0, frame)
+        self.frame_history = self.frame_history[:self.max_offset+1]
+
+        # ====================================================================
+        with torch.no_grad():
+            if len(self.frame_history) > self.max_offset:
+                # 1. RUN FASTSAM ONCE FOR THE CURRENT FRAME
+                img_np_fastsam = (frame.uimg.cpu().numpy() * 255).astype("uint8")
+                
+                sam_results = self.fastsam(
+                    img_np_fastsam, 
+                    device=self.device, 
+                    retina_masks=True, 
+                    conf=0.4, 
+                    iou=0.9, 
+                    verbose=False
+                )
+                
+                # Ultralytics has a built-in .plot() function that returns the overlay image in BGR
+                fastsam_viz_bgr = sam_results[0].plot(
+                    line_width=None,
+                    boxes=False,
+                    probs=False,
+                    labels=False,
+                    masks=True,
+                    color_mode="instance"
+                )
+                fastsam_viz_rgb = fastsam_viz_bgr[..., ::-1] # Convert BGR to RGB for matplotlib
+                
+                # Safely extract masks for the averaging logic later
+                masks = sam_results[0].masks.data if sam_results[0].masks is not None else None
+                
+                # Prepare the current frame (img1) for RAFT
+                img1 = frame.uimg.permute(2, 0, 1).unsqueeze(0)
+                img1 = (img1 * 2 - 1).to(self.device)
+                
+                # 2. SETUP PLOTTING GRID (3 Rows. At least 2 columns to fit Row 1)
+                num_cols = max(2, len(self.flow_offsets))
+                fig, axes = plt.subplots(3, num_cols, figsize=(5 * num_cols, 15), squeeze=False)
+                
+                # Plot Current Frame (Row 0, Col 0)
+                orig_img_np = (frame.uimg.cpu().numpy() * 255).astype("uint8")
+                axes[0, 0].imshow(orig_img_np)
+                axes[0, 0].set_title(f"Current Frame {frame.frame_id}")
+                axes[0, 0].axis("off")
+                
+                # Plot FastSAM Segmentations (Row 0, Col 1)
+                axes[0, 1].imshow(fastsam_viz_rgb)
+                axes[0, 1].set_title("FastSAM Segmentations")
+                axes[0, 1].axis("off")
+                
+                # Turn off unused empty axes in the top row
+                for j in range(2, num_cols):
+                    axes[0, j].axis("off")
+                
+                # 3. LOOP THROUGH TEMPORAL OFFSETS
+                for i, offset in enumerate(self.flow_offsets):
+                    past_frame = self.frame_history[offset]
+                    
+                    img2 = past_frame.uimg.permute(2, 0, 1).unsqueeze(0)
+                    img2 = (img2 * 2 - 1).to(self.device)
+                    
+                    # Predict Flow (Current Frame -> Past Frame)
+                    list_of_flows = self.raft_model(img1, img2)
+                    predicted_flow = list_of_flows[-1][0] # Shape: (2, H, W)
+                    
+                    # --- PLOT: RAW FLOW (Row 1) ---
+                    raw_flow_tensor = flow_to_image(predicted_flow)
+                    raw_flow_np = raw_flow_tensor.permute(1, 2, 0).cpu().numpy()
+                    
+                    axes[1, i].imshow(raw_flow_np)
+                    axes[1, i].set_title(f"Raw Flow (t - {offset})")
+                    axes[1, i].axis("off")
+                    
+                    # --- PLOT: AVERAGED FLOW (Row 2) ---
+                    avg_object_flow = predicted_flow.clone()
+                    
+                    if masks is not None:
+                        h, w = avg_object_flow.shape[1], avg_object_flow.shape[2]
+                        # Interpolate masks to match flow tensor dimensions
+                        masks_resized = F.interpolate(
+                            masks.unsqueeze(1), size=(h, w), mode='nearest'
+                        ).squeeze(1).bool()
+                        
+                        for mask in masks_resized:
+                            if mask.sum() > 0: 
+                                mean_u = avg_object_flow[0][mask].mean()
+                                mean_v = avg_object_flow[1][mask].mean()
+                                avg_object_flow[0][mask] = mean_u
+                                avg_object_flow[1][mask] = mean_v
+                                
+                    avg_flow_tensor = flow_to_image(avg_object_flow)
+                    avg_flow_np = avg_flow_tensor.permute(1, 2, 0).cpu().numpy()
+                    
+                    axes[2, i].imshow(avg_flow_np)
+                    axes[2, i].set_title(f"Avg Flow (t - {offset})")
+                    axes[2, i].axis("off")
+                
+                # Turn off any remaining unused axes if there are fewer offsets than 2
+                for row in [1, 2]:
+                    for j in range(len(self.flow_offsets), num_cols):
+                        axes[row, j].axis("off")
+                
+                plt.tight_layout()
+                plt.savefig(f"debug_optical_flow/flow_{frame.frame_id:04d}.png", bbox_inches='tight')
+                plt.close(fig)
+        # ====================================================================
 
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
             self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
@@ -93,6 +290,9 @@ class FrameTracker:
             return False, [], True
 
         frame.T_WC = T_WCf
+        print(f"trans kf->curr: {T_CkCf.translation()}")
+
+        self.compute_mask(frame)
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)

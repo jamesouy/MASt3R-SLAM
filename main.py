@@ -330,6 +330,15 @@ if __name__ == "__main__":
             cv2.imwrite(f"{savedir}/{i}.png", frame)
 
     print("done")
-    backend.join()
+
+    backend.join(timeout=5)
+    if backend.is_alive(): # sometimes backend fails to finish (race condition). 
+        backend.terminate() # this is just a hacky way to timeout if that happens
+        backend.join(timeout=3)
+        if backend.is_alive():
+            backend.kill()
+            backend.join()
+    
+    print("backend joined")
     if not args.no_viz:
         viz.join()

@@ -202,6 +202,8 @@ class SharedStates:
 
     def set_mode(self, mode):
         with self.lock:
+            if self.mode.value is Mode.TERMINATED:
+                return # should not be able to switch away from TERMINATED
             self.mode.value = mode
 
     def pause(self):

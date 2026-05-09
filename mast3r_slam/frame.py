@@ -24,6 +24,7 @@ class Frame:
     T_WC: lietorch.Sim3 = lietorch.Sim3.Identity(1)
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
+    M: Optional[torch.Tensor] = None # mask
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
     N: int = 0
@@ -44,6 +45,7 @@ class Frame:
         if self.N == 0:
             self.X_canon = X.clone()
             self.C = C.clone()
+            self.M = torch.ones(X.shape[0], dtype=bool, device=C.device)
             self.N = 1
             self.N_updates = 1
             if filtering_mode == "best_score":
@@ -148,7 +150,7 @@ class SharedStates:
         self.img_true_shape = torch.zeros(1, 2, device=device, dtype=torch.int).share_memory_()
         self.T_WC = lietorch.Sim3.Identity(1, device=device, dtype=dtype).data.share_memory_()
         self.X = torch.zeros(h * w, 3, device=device, dtype=dtype).share_memory_()
-        self.C = torch.zeros(h * w, 1, device=device, dtype=dtype).share_memory_()
+        self.C = torch.ones(h * w, 1, device=device, dtype=dtype).share_memory_()
         self.feat = torch.zeros(1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
         self.pos = torch.zeros(1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         # fmt: on
@@ -241,6 +243,7 @@ class SharedKeyframes:
         self.T_WC = torch.zeros(buffer, 1, lietorch.Sim3.embedded_dim, device=device, dtype=dtype).share_memory_()
         self.X = torch.zeros(buffer, h * w, 3, device=device, dtype=dtype).share_memory_()
         self.C = torch.zeros(buffer, h * w, 1, device=device, dtype=dtype).share_memory_()
+        self.M = torch.zeros(buffer, h * w, device=device, dtype=bool).share_memory_()
         self.N = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.N_updates = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.feat = torch.zeros(buffer, 1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
@@ -262,6 +265,7 @@ class SharedKeyframes:
             )
             kf.X_canon = self.X[idx]
             kf.C = self.C[idx]
+            kf.M = self.M[idx]
             kf.feat = self.feat[idx]
             kf.pos = self.pos[idx]
             kf.N = int(self.N[idx])
@@ -283,6 +287,7 @@ class SharedKeyframes:
             self.T_WC[idx] = value.T_WC.data
             self.X[idx] = value.X_canon
             self.C[idx] = value.C
+            self.M[idx] = value.M
             self.feat[idx] = value.feat
             self.pos[idx] = value.pos
             self.N[idx] = value.N

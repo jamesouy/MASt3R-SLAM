@@ -18,48 +18,16 @@ from torchvision.utils import flow_to_image
 from ultralytics import FastSAM
 import torch.nn.functional as F
 
+from thirdparty.NeuFlow_v2.NeuFlow.neuflow import NeuFlow
 
-DISABLE_PLOTS = False
-def start_plots(num_plots):
-    if DISABLE_PLOTS: return None, [None]*num_plots
-    return plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
+
 def plot_img(ax, title: str, img: torch.Tensor):
-    if DISABLE_PLOTS: return
     ax.imshow(img.cpu().numpy())
     ax.set_title(title)
     ax.axis("off")
 def plot_flow(ax, title: str, flow: torch.Tensor): # flow is [2, H, W]
-    if DISABLE_PLOTS: return
     flow_img_tensor = flow_to_image(flow).squeeze(0)
     plot_img(ax, title, flow_img_tensor.permute(1, 2, 0))
-def save_plots(fig, path):
-    if DISABLE_PLOTS: return
-    if not os.path.exists(os.path.dirname(path)):
-        os.makedirs(os.path.dirname(path))
-    plt.tight_layout()
-    plt.savefig(path, bbox_inches='tight')
-    plt.close(fig)
-
-def estimate_K(X: torch.Tensor, H, W):
-    '''X: [H, W, 3]'''
-    v, u = torch.meshgrid(
-        torch.arange(H, device=X.device, dtype=torch.float32),
-        torch.arange(W, device=X.device, dtype=torch.float32),
-        indexing="ij",
-    )
-    u = u.reshape(-1)
-    v = v.reshape(-1)
-    x = X[:, 0] / X[:, 2].clamp(min=1e-5)
-    y = X[:, 1] / X[:, 2].clamp(min=1e-5)
-    fx = torch.cov(torch.stack([u, x]))[0, 1] / torch.var(x)
-    cx = torch.mean(u) - fx * torch.mean(x)
-
-    fy = torch.cov(torch.stack([v, y]))[0,1] / torch.var(y)
-    cy = torch.mean(v) - fy * torch.mean(y)
-    
-    return torch.tensor([[fx, 0, cx],
-                         [0, fy, cy],
-                         [0, 0,  1]], device=X.device)
 
 class FrameTracker:
     def __init__(self, model, frames, device):
@@ -73,153 +41,50 @@ class FrameTracker:
         # ====================================================================
         os.makedirs("debug_optical_flow", exist_ok=True)
         print("Loading RAFT Optical Flow Model...")
-        from opticalflow.raft import RAFT as OPTICAL_FLOW_MODEL
-        # from opticalflow.sea_raft import SEA_RAFT as OPTICAL_FLOW_MODEL
-        self.flow_model = OPTICAL_FLOW_MODEL(device=self.device)
+        weights = Raft_Large_Weights.DEFAULT
+        self.raft_model = raft_large(weights=weights, progress=False).to(self.device)
+        self.raft_model.eval()
 
-        print("Loading FastSAM Model...")
-        # self.fastsam = FastSAM("FastSAM-s.pt")
-        self.fastsam = FastSAM("FastSAM-x.pt")
+        print("Loading FastSAM-S Model...")
+        self.fastsam = FastSAM("FastSAM-s.pt")
 
         self.flow_offsets = [1, 4, 8, 12] 
         self.max_offset = max(self.flow_offsets)
         self.frame_history = [] # 0=curr frame, 1=last frame, etc
-        self.prev_mask = None
         # ====================================================================
 
     # Initialize with identity indexing of size (1,n)
-    def reset_idx_f2k(self,):
+    def reset_idx_f2k(self):
         self.idx_f2k = None
-    
-    def segmentation(self, frame: Frame):
-        img_np_fastsam = (frame.uimg.cpu().numpy() * 255).astype("uint8")
-        sam_result = self.fastsam(
-            img_np_fastsam, 
-            device=self.device, 
-            retina_masks=True, 
-            conf=0.4, 
-            iou=0.9, 
-            verbose=False
-        )[0]
-        
-        # Safely extract masks for the averaging logic later
-        # masks = sam_result.masks.data if sam_result.masks is not None else None
-        assert sam_result.masks is not None
-        masks = sam_result.masks.data.to(self.device).bool()
-        [[H, W]] = frame.img_true_shape
-        assert masks.shape[1] == H and masks.shape[2] == W, f"masks shape: {masks.shape}"
 
-        # Sort area and filter to only area > 0
-        areas = masks.sum(dim=(1,2))
-        areas, sort_idx = torch.sort(areas, descending=True)
-        masks = masks[sort_idx][areas > 0]
-
-        return masks, sam_result # sam_result can be used for visualization
-    
-    def mask_prev_frame(self, frame: Frame, prev_frame: Frame):
-        '''places a mask on the previous frame instead of current frame'''
-        [[H, W]] = frame.img_true_shape
-
-        fig, axes = start_plots(6)
-        
-        # Transform from prev frame to curr frame
-        T = frame.T_WC.inv() * prev_frame.T_WC
-        X_trans = T.act(prev_frame.X_canon) # prev frame coords -> curr frame coords
-        depth = X_trans[:, 2]
-        plot_img(axes[0], f"Depth {frame.frame_id}", depth.view(H, W))
-
-        # Project to prev frame image plane
-        K = estimate_K(frame.X_canon, H, W)
-        X_proj = K @ X_trans.T
-        u_proj = (X_proj[0] / X_proj[2].clamp(min=1e-5))
-        v_proj = (X_proj[1] / X_proj[2].clamp(min=1e-5))
-
-        v_orig, u_orig = torch.meshgrid(
-            torch.arange(H, device=self.device, dtype=torch.float32),
-            torch.arange(W, device=self.device, dtype=torch.float32),
-            indexing="ij",
-        )
-
-        # Compute flow from projected points
-        flow_exp = torch.stack([
-            u_proj.view(H, W) - u_orig,
-            v_proj.view(H, W) - v_orig,
-        ], dim=0)  # (2, H, W)
-        plot_flow(axes[1], f"Expected Flow {frame.frame_id}", flow_exp)
-
-        # print(prev_frame.frame_id, prev_frame.img.shape, prev_frame.img.min(), prev_frame.img.max())
-        # mask_prev_frame called with first keyframe, which has shape 3, H, W
-        flow = self.flow_model(prev_frame.img.unsqueeze(0), frame.img)
-        plot_flow(axes[2], f"Computed Flow {frame.frame_id}", flow)
-
-        residual = (flow - flow_exp).norm(dim=0)
-        # residual = (residual - residual.median()).abs()
-        plot_img(axes[3], f"Residual {frame.frame_id}", residual)
-        
-        # avg_residual = residual.clone()
-        sam_masks, sam_result = self.segmentation(prev_frame)
-        avg_residual = torch.zeros(H, W, dtype=float).to(self.device)
-        background_mask = torch.ones(H, W, dtype=bool).to(self.device)
-        for mask in sam_masks:
-            background_mask[mask] = False
-            avg_residual[mask] = torch.max(avg_residual[mask], residual[mask].mean())
-        avg_residual[background_mask] = torch.max(avg_residual[background_mask], residual[background_mask].mean())
-        avg_residual = avg_residual - avg_residual.min()
-
-        plot_img(axes[4], f"Object Residual {frame.frame_id}", avg_residual)
-        
-        mask = (avg_residual > avg_residual.max()*0.1)
-        mask = (avg_residual >  torch.quantile(avg_residual, 0.70))
-
-        # max_pool2d acts as dilation on a binary mask
-        # We add batch and channel dims for the operator, then squeeze back
-        dilation_size = 7 
-        padding = dilation_size // 2
-        mask = F.max_pool2d(
-            mask.float().unsqueeze(0).unsqueeze(0), 
-            kernel_size=dilation_size, 
-            stride=1, 
-            padding=padding
-        ).bool().squeeze()
-        
-        plot_img(axes[5], f"Mask {frame.frame_id}", mask)
-        
-        save_plots(fig, f"debug_optical_flow_depth/{frame.frame_id:04d}.png")
-
-        mask = mask.reshape(-1)
-        prev_frame.N = 0 # set N to zero so update_pointmap treats this call as its first (so we won't be weighed against what is already there)
-        C_masked = prev_frame.C.clone()
-        C_masked[mask] = 0
-        # X_masked = prev_frame.X_canon.clone()
-        # X_masked[mask, 2] = 0
-        prev_frame.update_pointmap(prev_frame.X_canon, C_masked)
-
-        return mask
-
-    def compute_mask(self, frame: Frame, sam_masks):
+    def compute_mask(self, frame: Frame):
         offset = 4
         if len(self.frame_history) <= offset:
-            self.mask_prev_frame(frame, self.keyframes.last_keyframe())
             return
 
         [[H, W]] = frame.img_true_shape
         prev_frame = self.frame_history[offset]
 
-        fig, axes = start_plots(4)
-        plot_img((frame.uimg * 255).astype("uint8"))
+        num_plots = 4
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
         
-        # Transform from curr frame to prev frame
-        T = prev_frame.T_WC.inv() * frame.T_WC
-        X_trans = T.act(frame.X_canon) # curr frame coords -> prev frame coords
-        # X_trans = T.inv().act(prev_frame.X_canon) # curr frame coords -> prev frame coords
-        depth = X_trans[:, 2]
+        # transform points from prev frame to curr frame to get depth
+        # T_proj = frame.T_WC.inv() * prev_frame.T_WC
+        # T_proj = prev_frame.T_WC.inv() * frame.T_WC
+        T_proj = frame.T_WC * prev_frame.T_WC.inv()
+        print(f"trans prev->curr: {T_proj.translation()}")
+        X_prev = prev_frame.T_WC.act(prev_frame.X_canon) # world -> prev frame coords
+        # X_prev = X_prev * torch.tensor([1, -1, 1], device=self.device)
+        X_proj = frame.T_WC.inv().act(X_prev) # prev frame -> curr frame
+        # X_proj = T_proj.act(prev_frame.X_canon * torch.tensor([1, -1, 1], device=self.device)) # prev frame -> curr frame
+        # X_proj = X_proj * torch.tensor([1, -1, 1], device=self.device)
+        depth = X_proj[:, 2]
         plot_img(axes[0], f"Depth {frame.frame_id}", depth.view(H, W))
 
-        # Project to prev frame image plane
-        K = estimate_K(prev_frame.X_canon, H, W)
-        X_proj = K @ X_trans.T
-        u_proj = (X_proj[0] / X_proj[2].clamp(min=1e-5))
-        v_proj = (X_proj[1] / X_proj[2].clamp(min=1e-5))
+        u_proj = (X_proj[:, 0] / depth.clamp(min=0.0001))
+        v_proj = (X_proj[:, 1] / depth.clamp(min=0.0001))
+        u_proj = (u_proj - u_proj.min()) * W / (u_proj.max()-u_proj.min())
+        v_proj = (v_proj - v_proj.min()) * H / (v_proj.max()-v_proj.min())
 
         v_orig, u_orig = torch.meshgrid(
             torch.arange(H, device=self.device, dtype=torch.float32),
@@ -227,66 +92,53 @@ class FrameTracker:
             indexing="ij",
         )
 
-        # Compute flow from projected points
         flow_exp = torch.stack([
-            u_proj.view(H, W) - u_orig,
-            v_proj.view(H, W) - v_orig,
+            u_orig - u_proj.view(H, W),
+            v_orig - v_proj.view(H, W),
         ], dim=0)  # (2, H, W)
         plot_flow(axes[1], f"Expected Flow {frame.frame_id}", flow_exp)
 
-        flow = self.flow_model(frame.img, prev_frame.img)
+        flow = self.raft_model(frame.img, prev_frame.img)[-1][0] # [2, H, W]
         plot_flow(axes[2], f"Computed Flow {frame.frame_id}", flow)
 
         residual = (flow - flow_exp).norm(dim=0)
-        # residual = (residual - residual.median()).abs()
+        residual = (residual - residual.median()).abs()
+        print("residual range:", residual.min(), residual.max())
         plot_img(axes[3], f"Residual {frame.frame_id}", residual)
         
-        # avg_residual = residual.clone()
-        avg_residual = torch.zeros(H, W, dtype=float).to(self.device)
-        background_mask = torch.ones(H, W, dtype=bool).to(self.device)
-        for mask in sam_masks:
-            background_mask[mask] = False
-            avg_residual[mask] = torch.max(avg_residual[mask], residual[mask].mean())
-        avg_residual[background_mask] = torch.max(avg_residual[background_mask], residual[background_mask].mean())
-        avg_residual = avg_residual - avg_residual.min()
-
-        plot_img(axes[4], f"Object Residual {frame.frame_id}", avg_residual)
-        
-        # mask = (avg_residual > avg_residual.max()*0.2)
-        mask = avg_residual > torch.quantile(avg_residual, 0.90)
-        # mask = (avg_residual >  torch.quantile(avg_residual, 0.70))
-        
-        # max_pool2d acts as dilation on a binary mask
-        # We add batch and channel dims for the operator, then squeeze back
-        dilation_size = 7 
-        padding = dilation_size // 2
-        mask = F.max_pool2d(
-            mask.float().unsqueeze(0).unsqueeze(0), 
-            kernel_size=dilation_size, 
-            stride=1, 
-            padding=padding
-        ).bool().squeeze()
-
-        plot_img(axes[5], f"Mask {frame.frame_id}", mask)
-        
-        save_plots(fig, f"debug_optical_flow_depth/{frame.frame_id:04d}.png")
-
-        return mask
+        if not os.path.exists("debug_optical_flow_depth"):
+            os.makedirs("debug_optical_flow_depth")
+        plt.tight_layout()
+        plt.savefig(f"debug_optical_flow_depth/{frame.frame_id:04d}.png", bbox_inches='tight')
+        plt.close(fig)
 
     def track(self, frame: Frame):
-        print(f"tracking frame {frame.frame_id}")
         keyframe = self.keyframes.last_keyframe()
 
         self.frame_history.insert(0, frame)
         self.frame_history = self.frame_history[:self.max_offset+1]
 
         # ====================================================================
-        # 1. RUN FASTSAM ONCE FOR THE CURRENT FRAME
-        # sam_masks, sam_result = self.segmentation(frame)
-        
         with torch.no_grad():
-            if len(self.frame_history) > self.max_offset and False:
+            if len(self.frame_history) > self.max_offset:
+                # 1. RUN FASTSAM ONCE FOR THE CURRENT FRAME
+                img_np_fastsam = (frame.uimg.cpu().numpy() * 255).astype("uint8")
                 
+                sam_results = self.fastsam(
+                    img_np_fastsam, 
+                    device=self.device, 
+                    retina_masks=True, 
+                    conf=0.4, 
+                    iou=0.9, 
+                    verbose=False
+                )
+                
+                # Ultralytics has a built-in .plot() function that returns the overlay image in BGR
+                fastsam_viz_bgr = sam_results[0].plot()
+                fastsam_viz_rgb = fastsam_viz_bgr[..., ::-1] # Convert BGR to RGB for matplotlib
+                
+                # Safely extract masks for the averaging logic later
+                masks = sam_results[0].masks.data if sam_results[0].masks is not None else None
                 
                 # Prepare the current frame (img1) for RAFT
                 img1 = frame.uimg.permute(2, 0, 1).unsqueeze(0)
@@ -303,16 +155,7 @@ class FrameTracker:
                 axes[0, 0].axis("off")
                 
                 # Plot FastSAM Segmentations (Row 0, Col 1)
-                # Ultralytics has a built-in .plot() function that returns the overlay image in BGR
-                fastsam_viz_bgr = sam_result.plot(
-                    line_width=None,
-                    boxes=False,
-                    probs=False,
-                    labels=False,
-                    masks=True,
-                    color_mode="instance"
-                )
-                axes[0, 1].imshow(fastsam_viz_bgr[..., ::-1]) # Convert BGR to RGB for matplotlib
+                axes[0, 1].imshow(fastsam_viz_rgb)
                 axes[0, 1].set_title("FastSAM Segmentations")
                 axes[0, 1].axis("off")
                 
@@ -328,7 +171,8 @@ class FrameTracker:
                     img2 = (img2 * 2 - 1).to(self.device)
                     
                     # Predict Flow (Current Frame -> Past Frame)
-                    predicted_flow = self.flow_model(img1, img2)
+                    list_of_flows = self.raft_model(img1, img2)
+                    predicted_flow = list_of_flows[-1][0] # Shape: (2, H, W)
                     
                     # --- PLOT: RAW FLOW (Row 1) ---
                     raw_flow_tensor = flow_to_image(predicted_flow)
@@ -341,11 +185,11 @@ class FrameTracker:
                     # --- PLOT: AVERAGED FLOW (Row 2) ---
                     avg_object_flow = predicted_flow.clone()
                     
-                    if sam_masks is not None:
+                    if masks is not None:
                         h, w = avg_object_flow.shape[1], avg_object_flow.shape[2]
                         # Interpolate masks to match flow tensor dimensions
                         masks_resized = F.interpolate(
-                            sam_masks.unsqueeze(1), size=(h, w), mode='nearest'
+                            masks.unsqueeze(1), size=(h, w), mode='nearest'
                         ).squeeze(1).bool()
                         
                         for mask in masks_resized:
@@ -437,64 +281,12 @@ class FrameTracker:
             return False, [], True
 
         frame.T_WC = T_WCf
+        print(f"trans kf->curr: {T_CkCf.translation()}")
 
-        # offset = 4
-        # if len(self.frame_history) > offset and self.frame_history[offset].frame_id == keyframe.frame_id:
-        #     print(f"masking keyframe {keyframe.frame_id}")
-        #     self.mask_prev_frame(frame)
-
-        # self.mask_prev_frame(frame)
-
-        # sam_masks, sam_result = self.segmentation(frame)
-        # mask = self.compute_mask(frame, sam_masks)
-        # if mask is None:
-        #     mask = torch.zeros(frame.X_canon.shape[0], dtype=bool) # if can't get mask, just don't save this 3D map
-        # else:
-        #     mask = mask.reshape(-1)
-        # frame.N = 0 # set N to zero so update_pointmap treats this call as its first (so we won't be weighed against what is already there)
-        # C_masked = frame.C.clone()
-        # C_masked[mask] = 0
-        # X_masked = frame.X_canon.clone()
-        # print(X_masked.shape, mask.shape)
-        # X_masked[mask, :] = X_masked[mask, :] * 1e10
-        # frame.update_pointmap(X_masked, C_masked)
-
-        sam_masks, sam_result = self.segmentation(frame)
-        mask = self.compute_mask(frame, sam_masks)
-
-        if mask is None:
-            mask = torch.zeros(frame.X_canon.shape[0], dtype=bool, device=self.device)
-        else:
-            mask = mask.reshape(-1)
-
-        # mask out points in current frame
-        # frame.N = 0 # set N to zero so update_pointmap treats this call as its first (so we won't be weighed against what is already there)
-        # # frame.C[mask] *= 0.1
-        # C_masked = frame.C.clone()
-        # C_masked[mask] = 0
-        # frame.update_pointmap(frame.X_canon, C_masked)
-
-        # mask out corresponding points in keyframe
-        # if self.prev_mask is not None:
-        #     combined_mask = mask | self.prev_mask
-        #     self.prev_mask = mask
-        #     mask = combined_mask
-        # mask_in_kf = mask[idx_f2k]
-        # Ckf = Ckf.clone()
-        # Ckf[mask_in_kf] = 0 # Prevent NEW dynamic points from entering the map
-        # # keyframe.C[mask_in_kf] *= 0.5  # ACTIVE ERASURE: Degrade confidence of existing ghosts in the map
-        # keyframe.C[mask_in_kf] *= 0.1  # ACTIVE ERASURE: Degrade confidence of existing ghosts in the map
-
-        frame.M = ~mask
-        mask_in_kf = ~mask[idx_f2k]
-        keyframe.M[~mask_in_kf] = False
-        keyframe.M[mask_in_kf] = True
-        Ckf = Ckf.clone()
-        Ckf[~mask_in_kf] = 0 # Prevent NEW dynamic points from entering the map
+        self.compute_mask(frame)
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
-        keyframe.X_canon[mask_in_kf] = Xkk[mask_in_kf]
         keyframe.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
         self.keyframes[len(self.keyframes) - 1] = keyframe

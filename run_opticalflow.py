@@ -34,14 +34,14 @@ if __name__ == "__main__":
     from opticalflow.neuflow import NeuFlow
     models.append(NeuFlow(h, w))
 
-    # from opticalflow.flowformer import FlowFormer
-    # models.append(FlowFormer())
+    from opticalflow.flowformer import FlowFormer
+    models.append(FlowFormer())
 
     # from opticalflow.flowformerpp import FlowFormerPlusPlus
     # models.append(FlowFormerPlusPlus())
 
-    from opticalflow.sea_raft import SEA_RAFT
-    models.append(SEA_RAFT())
+    # from opticalflow.sea_raft import SEA_RAFT
+    # models.append(SEA_RAFT())
 
     def load_img(index):
         '''loads image in RGB 1xCxHxW [-1, 1] float (RAFT/MASt3R) format'''

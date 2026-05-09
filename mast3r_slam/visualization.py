@@ -136,7 +136,9 @@ class Window(WindowEvents):
             keyframe = self.keyframes[kf_idx]
             h, w = keyframe.img_shape.flatten()
             X = self.frame_X(keyframe)
-            C = keyframe.get_average_conf().cpu().numpy().astype(np.float32)
+            C = keyframe.get_average_conf()
+            C[~keyframe.M] = 0
+            C = C.cpu().numpy().astype(np.float32)
 
             if keyframe.frame_id not in self.textures:
                 ptex = self.ctx.texture((w, h), 3, dtype="f4", alignment=4)
@@ -413,6 +415,11 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main) -> None:
         wnd=window,
         timer=timer,
     )
+
+    # FIX: Use the property setter to automatically wire up the 
+    # mouse_position, mouse_press, and key_event callbacks to ImGui.
+    window.config = window_config
+
     # Avoid the event assigning in the property setter for now
     # We want the even assigning to happen in WindowConfig.__init__
     # so users are free to assign them in their own __init__.
@@ -425,6 +432,17 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main) -> None:
     window.set_default_viewport()
 
     timer.start()
+
+    # Explicitly map the window's render callback to class's render method
+    window.render_func = window_config.render
+    window.resize_func = window_config.resize
+    window.key_event_func = window_config.key_event
+    window.mouse_position_event_func = window_config.mouse_position_event
+    window.mouse_drag_event_func = window_config.mouse_drag_event
+    window.mouse_press_event_func = window_config.mouse_press_event
+    window.mouse_release_event_func = window_config.mouse_release_event
+    window.mouse_scroll_event_func = window_config.mouse_scroll_event
+    window.unicode_char_entered_func = window_config.unicode_char_entered
 
     while not window.is_closing:
         current_time, delta = timer.next_frame()

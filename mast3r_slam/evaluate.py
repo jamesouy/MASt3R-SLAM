@@ -61,7 +61,7 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
         valid = (
             keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
             > c_conf_threshold
-        )
+        ) & keyframe.M.cpu().numpy()
         pointclouds.append(pW[valid])
         colors.append(color[valid])
     pointclouds = np.concatenate(pointclouds, axis=0)
